@@ -16,6 +16,7 @@ source-repository head
 library
   build-depends:
     base,
+    containers,
     pure-txt,
     pure-core,
     xss-sanitize
