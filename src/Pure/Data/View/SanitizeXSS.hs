@@ -1,53 +1,109 @@
-{-# language LambdaCase, RecordWildCards, PatternSynonyms, OverloadedStrings #-}
-module Pure.Data.View.SanitizeXSS (sanitize,Options(..)) where
+{-# language LambdaCase, RecordWildCards, PatternSynonyms, OverloadedStrings, NamedFieldPuns #-}
+module Pure.Data.View.SanitizeXSS (sanitize,Processed(..),Options(..),allowDataAttribute,defaultOptions) where
 
 import Pure.Data.View (View(..),Features(..))
 import Pure.Data.View.Patterns (pattern Null)
 import Pure.Data.Txt as Txt (Txt,toLower,splitOn,isPrefixOf,fromTxt,toTxt)
-import Text.HTML.SanitizeXSS (safeTagName,sanitizeAttribute)
+import Text.HTML.SanitizeXSS (safeTagName,sanitizeAttribute,sanitaryURI)
 import qualified Data.Map as Map (mapMaybeWithKey)
+import qualified Data.Set as Set (toList,fromList)
+import Data.Maybe (mapMaybe)
+
+data Processed = Allow | Disallow | Defer
+processed :: a -> a -> a -> Processed -> a
+processed allow disallow defer = \case
+  Allow -> allow
+  Disallow -> disallow
+  Defer -> defer
 
 data Options = Options
-  { allowCustomViews :: Bool
-  , allowDataAttributes :: Bool
+  { allowSVG :: Bool
+  , allowCustomViews :: Bool
+  , processTag :: Txt -> Processed
+  , processAttribute :: (Txt,Txt) -> Processed
+  , processProperty :: (Txt,Txt) -> Processed
+  , processStyle :: (Txt,Txt) -> Processed
+  , processClass :: Txt -> Processed
   }
 
+allowDataAttribute :: (Txt,Txt) -> Processed
+allowDataAttribute (k,_) | "data-" `Txt.isPrefixOf` k = Allow
+allowDataAttribute _ = Defer
+
+-- Default options defers all sanitization to xss-sanitize and
+-- disallows SVG and custom views like keyed HTML, Portals, etc....
 defaultOptions :: Options
 defaultOptions = Options 
-  { allowCustomViews = True 
-  , allowDataAttributes = True
+  { allowSVG = False
+  , allowCustomViews = False
+  , processTag = const Defer
+  , processAttribute = const Defer
+  , processProperty = const Defer
+  , processStyle = const Defer
+  , processClass = const Defer
   }
 
 -- | Sanitize HTML and SVG views and discard raw views.
 sanitize :: Options -> View -> View
-sanitize Options {..} = go
+sanitize opts@Options { allowSVG, allowCustomViews, processTag } = go
   where
     go = \case
-      HTMLView {..}
-        | safeTagName (Txt.fromTxt (Txt.toLower tag))
-        , fs <- sanitizeFeatures allowDataAttributes features
-        , cs <- fmap go children
-        -> HTMLView { features = fs, children = cs, .. }
+      HTMLView {..} | t <- Txt.toLower tag -> 
+        let
+          safe = HTMLView 
+            { features = sanitizeFeatures opts features
+            , children = fmap go children
+            , .. 
+            } 
+          unsafe = Null
+        in case processTag t of
+          Allow                 -> safe
+          Defer | safeTagName t -> safe
+          _                     -> unsafe
 
-      SVGView {..}
-        | safeTagName (Txt.fromTxt (Txt.toLower tag))
-        , fs <- sanitizeFeatures allowDataAttributes features
-        , cs <- fmap go children
-        -> SVGView { features = fs, children = cs, .. }
+      SVGView {..} | allowSVG, t <- Txt.toLower tag ->
+        let
+          safe = SVGView 
+            { features = sanitizeFeatures opts features
+            , children = fmap go children
+            , .. 
+            }
+          unsafe = Null
+        in case processTag t of
+          Allow                 -> safe
+          Defer | safeTagName t -> safe
+          _                     -> unsafe
 
-      KHTMLView {..}
-        | safeTagName (Txt.fromTxt (Txt.toLower tag))
-        , fs <- sanitizeFeatures allowDataAttributes features
-        , kcs <- fmap (fmap go) keyedChildren
-        -> KHTMLView { features = fs, keyedChildren = kcs, .. }
+      KHTMLView {..} | allowCustomViews, t <- Txt.toLower tag ->
+        let
+          safe = KHTMLView 
+            { features = sanitizeFeatures opts features
+            , keyedChildren = fmap (fmap go) keyedChildren
+            , .. 
+            } 
+          unsafe = Null
+        in case processTag t of
+          Allow                 -> safe
+          Defer | safeTagName t -> safe
+          _                     -> unsafe
         
-      KSVGView {..}
-        | safeTagName (Txt.fromTxt (Txt.toLower tag))
-        , fs <- sanitizeFeatures allowDataAttributes features
-        , kcs <- fmap (fmap go) keyedChildren
-        -> KSVGView { features = fs, keyedChildren = kcs, .. }
+      KSVGView {..} | allowSVG, allowCustomViews, t <- Txt.toLower tag ->
+        let
+          safe = KSVGView 
+            { features = sanitizeFeatures opts features
+            , keyedChildren = fmap (fmap go) keyedChildren
+            , .. 
+            }
+          unsafe = Null
+        in case processTag t of
+          Allow                 -> safe
+          Defer | safeTagName t -> safe
+          _                     -> unsafe
 
-      tv@TextView{}  -> tv
+      Prebuilt v | allowCustomViews -> 
+        Prebuilt (go v)
+
+      tv@TextView{} -> tv
 
       -- These cases must not have come from de-serialization.
       SomeView a | allowCustomViews -> SomeView a
@@ -55,7 +111,6 @@ sanitize Options {..} = go
       TaggedView __w v | allowCustomViews -> TaggedView __w v
       PortalView pp pd pv | allowCustomViews -> PortalView pp pd pv
       ComponentView __w r c p | allowCustomViews -> ComponentView __w r c p
-      Prebuilt v | allowCustomViews -> Prebuilt v
       
       -- RawView and any unsafe tags are discarded
       _ -> Null
@@ -63,29 +118,34 @@ sanitize Options {..} = go
 -- | Sanitize features of HTML and SVG views. Note that listeners
 -- are kept because they are not serialized with the base libraries
 -- and, thus, must have been constructed on the client.
-sanitizeFeatures :: Bool -> Features -> Features
-sanitizeFeatures allowDataAttributes Features_ {..} =
+sanitizeFeatures :: Options -> Features -> Features
+sanitizeFeatures Options {..} Features_ {..} =
   Features_
-    { attributes = Map.mapMaybeWithKey (cleanAttribute allowDataAttributes) attributes 
-    , properties = Map.mapMaybeWithKey (cleanAttribute allowDataAttributes) properties
-    , styles     = Map.mapMaybeWithKey cleanStyle     styles
+    { attributes = Map.mapMaybeWithKey (cleanAttribute processAttribute) attributes 
+    , properties = Map.mapMaybeWithKey (cleanAttribute processProperty) properties
+    , styles     = Map.mapMaybeWithKey (cleanStyle processStyle) styles
+    , classes    = Set.fromList (mapMaybe (cleanClass processClass) (Set.toList classes))
     , ..
     } 
 
-cleanAttribute :: Bool -> Txt -> Txt -> Maybe Txt
-cleanAttribute allowDataAttributes k v 
-  | allowDataAttributes
-  , "data-" `Txt.isPrefixOf` k
-  = Just v
-  
-  | otherwise
-  = fmap (Txt.toTxt . snd) (sanitizeAttribute (Txt.fromTxt k,Txt.fromTxt v))
+cleanAttribute :: ((Txt,Txt) -> Processed) -> Txt -> Txt -> Maybe Txt
+cleanAttribute process k v =
+  case process (k,v) of
+    Allow -> Just v
+    Defer | Just (k,v) <- sanitizeAttribute (Txt.fromTxt k,Txt.fromTxt v) -> Just v
+    _ -> Nothing
 
-cleanStyle :: Txt -> Txt -> Maybe Txt
-cleanStyle k v 
-  | Just kv <- fmap snd (sanitizeAttribute ("style",Txt.fromTxt (k <> ": " <> v)))
-  , [_,v] <- Txt.splitOn ":" (Txt.toTxt kv)
-  = Just v
+cleanStyle :: ((Txt,Txt) -> Processed) -> Txt -> Txt -> Maybe Txt
+cleanStyle process k v  =
+  case process (k,v) of
+    Allow -> Just v
+    Defer | Just (_,kv) <- sanitizeAttribute ("style",Txt.fromTxt (k <> ": " <> v)) 
+          , [_,v] <- Txt.splitOn ":" (Txt.toTxt kv)
+          -> Just v
+    _ -> Nothing
 
-  | otherwise
-  = Nothing
+cleanClass :: (Txt -> Processed) -> Txt -> Maybe Txt
+cleanClass process c =
+  case process c of
+    Allow -> Just c
+    _     -> Nothing
