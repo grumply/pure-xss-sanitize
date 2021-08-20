@@ -3,7 +3,7 @@ module Pure.Data.View.SanitizeXSS (sanitize,Processed(..),Options(..),allowDataA
 
 import Pure.Data.View (View(..),Features(..))
 import Pure.Data.View.Patterns (pattern Null)
-import Pure.Data.Txt as Txt (Txt,toLower,splitOn,isPrefixOf,fromTxt,toTxt)
+import Pure.Data.Txt.Internal as Txt (Txt,toLower,splitOn,isPrefixOf,fromTxt,toTxt)
 import Text.HTML.SanitizeXSS (safeTagName,sanitizeAttribute,sanitaryURI)
 import qualified Data.Map as Map (mapMaybeWithKey)
 import qualified Data.Set as Set (toList,fromList)
@@ -57,9 +57,9 @@ sanitize opts@Options { allowSVG, allowCustomViews, processTag } = go
             } 
           unsafe = Null
         in case processTag t of
-          Allow                 -> safe
-          Defer | safeTagName t -> safe
-          _                     -> unsafe
+          Allow                           -> safe
+          Defer | safeTagName (fromTxt t) -> safe
+          _                               -> unsafe
 
       SVGView {..} | allowSVG, t <- Txt.toLower tag ->
         let
@@ -70,9 +70,9 @@ sanitize opts@Options { allowSVG, allowCustomViews, processTag } = go
             }
           unsafe = Null
         in case processTag t of
-          Allow                 -> safe
-          Defer | safeTagName t -> safe
-          _                     -> unsafe
+          Allow                           -> safe
+          Defer | safeTagName (fromTxt t) -> safe
+          _                               -> unsafe
 
       KHTMLView {..} | allowCustomViews, t <- Txt.toLower tag ->
         let
@@ -83,9 +83,9 @@ sanitize opts@Options { allowSVG, allowCustomViews, processTag } = go
             } 
           unsafe = Null
         in case processTag t of
-          Allow                 -> safe
-          Defer | safeTagName t -> safe
-          _                     -> unsafe
+          Allow                           -> safe
+          Defer | safeTagName (fromTxt t) -> safe
+          _                               -> unsafe
         
       KSVGView {..} | allowSVG, allowCustomViews, t <- Txt.toLower tag ->
         let
@@ -96,9 +96,9 @@ sanitize opts@Options { allowSVG, allowCustomViews, processTag } = go
             }
           unsafe = Null
         in case processTag t of
-          Allow                 -> safe
-          Defer | safeTagName t -> safe
-          _                     -> unsafe
+          Allow                           -> safe
+          Defer | safeTagName (fromTxt t) -> safe
+          _                               -> unsafe
 
       Prebuilt v | allowCustomViews -> 
         Prebuilt (go v)
@@ -132,7 +132,7 @@ cleanAttribute :: ((Txt,Txt) -> Processed) -> Txt -> Txt -> Maybe Txt
 cleanAttribute process k v =
   case process (k,v) of
     Allow -> Just v
-    Defer | Just (k,v) <- sanitizeAttribute (Txt.fromTxt k,Txt.fromTxt v) -> Just v
+    Defer | Just (k,v) <- sanitizeAttribute (Txt.fromTxt k,Txt.fromTxt v) -> Just (toTxt v)
     _ -> Nothing
 
 cleanStyle :: ((Txt,Txt) -> Processed) -> Txt -> Txt -> Maybe Txt
